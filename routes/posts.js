@@ -1,54 +1,35 @@
 // backend-posts-imagens/routes/posts.js
+
 const express = require('express');
-const multer = require('multer');
-const path = require('path'); // Módulo nativo do Node.js para lidar com caminhos de arquivos
-const fs = require('fs'); // Módulo nativo do Node.js para lidar com sistema de arquivos
-const Post = require('../models/post'); // Importa o modelo Post que criamos
-
 const router = express.Router();
+const Post = require('../models/post'); // Importa o modelo Post
+const multer = require('multer'); // Para lidar com upload de arquivos
+const fs = require('fs'); // Módulo nativo para lidar com sistema de arquivos (será usado para deletar localmente)
+const path = require('path'); // Módulo nativo para lidar com caminhos de arquivos
 
-// --- Configuração do Multer para Armazenamento de Imagens ---
-// Define onde os arquivos serão salvos e como serão nomeados
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        // Garante que a pasta 'uploads' exista. Se não, ela será criada.
-        const uploadDir = './uploads/';
-        if (!fs.existsSync(uploadDir)) {
-            fs.mkdirSync(uploadDir);
-        }
-        cb(null, uploadDir);
-    },
-    filename: (req, file, cb) => {
-        // Define o nome do arquivo para ser único: campo original + timestamp + extensão original
-        cb(null, `${file.fieldname}-${Date.now()}${path.extname(file.originalname)}`);
-    }
+// --- Configuração do Cloudinary ---
+const cloudinary = require('cloudinary').v2; // Importa o SDK do Cloudinary
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
 });
+// --- Fim da Configuração do Cloudinary ---
 
-// Filtro para aceitar apenas imagens
-const fileFilter = (req, file, cb) => {
-    const filetypes = /jpeg|jpg|png|gif/; // Tipos de arquivo permitidos
-    const mimetype = filetypes.test(file.mimetype); // Verifica o tipo MIME
-    const extname = filetypes.test(path.extname(file.originalname).toLowerCase()); // Verifica a extensão
-
-    if (mimetype && extname) {
-        return cb(null, true); // Aceita o arquivo
-    } else {
-        cb('Error: Apenas imagens são permitidas!'); // Rejeita o arquivo
-    }
-};
-
-// Inicializa o Multer com as configurações
+// --- Configuração do Multer (ARMAZENAMENTO EM MEMÓRIA!) ---
+// Agora o Multer armazena o arquivo na memória RAM (buffer) em vez de no disco.
+// Isso é crucial para enviar para serviços como Cloudinary.
+const storage = multer.memoryStorage();
 const upload = multer({
     storage: storage,
-    limits: { fileSize: 10 * 1024 * 1024 }, // Limite de 10MB por arquivo (em bytes)
-    fileFilter: fileFilter
+    limits: { fileSize: 1024 * 1024 * 5 } // Limite de 5MB por arquivo (ajuste se necessário)
 });
+// --- Fim da Configuração do Multer ---
 
-// --- Rotas da API ---
 
 // @route   POST /api/posts
-// @desc    Cria um novo post de imagem
-// @access  Public (por enquanto, sem autenticação)
+// @desc    Criar um novo post com imagem
+// @access  Public
 router.post('/', upload.single('image'), async (req, res) => {
     try {
         // Verifica se um arquivo foi enviado
@@ -56,66 +37,72 @@ router.post('/', upload.single('image'), async (req, res) => {
             return res.status(400).json({ msg: 'Nenhuma imagem enviada. Por favor, inclua um arquivo de imagem com o campo "image".' });
         }
 
-        // Cria um novo post usando o modelo
-        const newPost = new Post({
-            title: req.body.title,
-            description: req.body.description,
-            // O imageUrl será o caminho público para a imagem no servidor
-            imageUrl: `/uploads/${req.file.filename}`
-        });
+        // --- Upload da imagem para o Cloudinary ---
+        const result = await cloudinary.uploader.upload_stream(
+            { folder: 'backend-posts-imagens' }, // Pasta para organizar suas imagens no Cloudinary
+            async (error, cloudinaryResult) => {
+                if (error) {
+                    console.error('Erro ao fazer upload para o Cloudinary:', error);
+                    return res.status(500).json({ msg: 'Erro ao fazer upload da imagem.' });
+                }
 
-        // Salva o post no banco de dados
-        const post = await newPost.save();
-        res.status(201).json(post); // Retorna o post criado com status 201 (Created)
+                // Se o upload para o Cloudinary foi bem-sucedido:
+                const newPost = new Post({
+                    title: req.body.title,
+                    description: req.body.description,
+                    imageUrl: cloudinaryResult.secure_url // Salva a URL segura da imagem do Cloudinary
+                });
+
+                const post = await newPost.save();
+                res.status(201).json(post);
+            }
+        ).end(req.file.buffer); // Envia o buffer da imagem (da memória) para o Cloudinary
+        // --- Fim do Upload para o Cloudinary ---
 
     } catch (err) {
         console.error(err.message);
-        // Se o erro for do Multer (ex: tipo de arquivo inválido), retorna 400
-        if (err.message === 'Apenas imagens são permitidas!') {
-            return res.status(400).json({ msg: err.message });
-        }
-        res.status(500).send('Erro no Servidor');
+        res.status(500).send('Erro do Servidor');
     }
 });
 
 // @route   GET /api/posts
-// @desc    Obtém todos os posts, ordenados do mais recente para o mais antigo
+// @desc    Obter todos os posts
 // @access  Public
 router.get('/', async (req, res) => {
     try {
-        const posts = await Post.find().sort({ createdAt: -1 }); // Encontra todos e ordena por data de criação decrescente
+        const posts = await Post.find().sort({ createdAt: -1 }); // Ordena do mais novo para o mais antigo
         res.json(posts);
     } catch (err) {
         console.error(err.message);
-        res.status(500).send('Erro no Servidor');
+        res.status(500).send('Erro do Servidor');
     }
 });
 
 // @route   GET /api/posts/:id
-// @desc    Obtém um post específico pelo ID
+// @desc    Obter um post por ID
 // @access  Public
 router.get('/:id', async (req, res) => {
     try {
-        const post = await Post.findById(req.params.id); // Busca um post pelo ID fornecido na URL
+        const post = await Post.findById(req.params.id);
 
         if (!post) {
-            return res.status(404).json({ msg: 'Post não encontrado' }); // Retorna 404 se o post não existir
+            return res.status(404).json({ msg: 'Post não encontrado' });
         }
 
         res.json(post);
     } catch (err) {
         console.error(err.message);
-        // Se o ID não for um formato válido do MongoDB, o erro.kind será 'ObjectId'
+        // Captura o erro se o ID não for um ObjectId válido do MongoDB
         if (err.kind === 'ObjectId') {
-            return res.status(404).json({ msg: 'Post não encontrado' });
+            return res.status(400).json({ msg: 'ID do post inválido' });
         }
-        res.status(500).send('Erro no Servidor');
+        res.status(500).send('Erro do Servidor');
     }
 });
 
 // @route   DELETE /api/posts/:id
-// @desc    Deleta um post específico pelo ID
-// @access  Public (por enquanto, sem autenticação)
+// @desc    Deletar um post
+// @access  Public
 router.delete('/:id', async (req, res) => {
     try {
         const post = await Post.findById(req.params.id);
@@ -124,24 +111,32 @@ router.delete('/:id', async (req, res) => {
             return res.status(404).json({ msg: 'Post não encontrado' });
         }
 
-        // Remove o arquivo de imagem do sistema de arquivos local
-        const imagePath = path.join(__dirname, '..', post.imageUrl);
-        if (fs.existsSync(imagePath)) {
-            fs.unlinkSync(imagePath); // Deleta o arquivo
+        // --- Deletar imagem do Cloudinary (se existir) ---
+        // Verifica se a URL da imagem é do Cloudinary antes de tentar deletar
+        if (post.imageUrl && post.imageUrl.includes('cloudinary.com')) {
+            // Extrai o public ID da URL do Cloudinary
+            const publicId = post.imageUrl.split('/').pop().split('.')[0];
+            await cloudinary.uploader.destroy(`backend-posts-imagens/${publicId}`, (error, result) => {
+                if (error) {
+                    console.error('Erro ao deletar imagem do Cloudinary:', error);
+                    // Loga o erro, mas não impede a deleção do post no DB
+                } else {
+                    console.log('Imagem deletada do Cloudinary:', result);
+                }
+            });
         }
 
-        await Post.deleteOne({ _id: req.params.id }); // Deleta o registro do banco de dados
+        // Remove o post do MongoDB
+        await post.deleteOne(); // Usar post.deleteOne() no Mongoose 6+
 
         res.json({ msg: 'Post removido com sucesso' });
-
     } catch (err) {
         console.error(err.message);
         if (err.kind === 'ObjectId') {
-            return res.status(404).json({ msg: 'Post não encontrado' });
+            return res.status(400).json({ msg: 'ID do post inválido' });
         }
-        res.status(500).send('Erro no Servidor');
+        res.status(500).send('Erro do Servidor');
     }
 });
-
 
 module.exports = router;
